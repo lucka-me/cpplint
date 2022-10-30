@@ -1286,6 +1286,7 @@ class _CppLintState(object):
     # can be written into the XML
     self._junit_errors = []
     self._junit_failures = []
+    self._junit_passes = []
 
   def SetOutputFormat(self, output_format):
     """Sets the output format for errors."""
@@ -1373,9 +1374,9 @@ class _CppLintState(object):
     if not _quiet and self.output_format not in _MACHINE_OUTPUTS:
       sys.stdout.write(message)
 
-  def PrintError(self, message):
+  def PrintError(self, filename, message):
     if self.output_format == 'junit':
-      self._junit_errors.append(message)
+      self._junit_errors.append((filename, message))
     else:
       sys.stderr.write(message)
 
@@ -1383,45 +1384,51 @@ class _CppLintState(object):
     self._junit_failures.append((filename, linenum, message, category,
         confidence))
 
+  def AddPass(self, filename):
+    if self.output_format == 'junit':
+      self._junit_passes.append(filename)
+
   def FormatJUnitXML(self):
-    num_errors = len(self._junit_errors)
-    num_failures = len(self._junit_failures)
+    # Group by file
+    files_order = []
+    errors_by_file = {}
+    failures_by_file = {}
+    for error in self._junit_errors:
+      error_file = error[0]
+      if error_file not in files_order:
+        files_order.append(error_file)
+        errors_by_file[error_file] = []
+      errors_by_file[error_file].append(error[1])
+    for failure in self._junit_failures:
+      failed_file = failure[0]
+      if failed_file not in files_order:
+        files_order.append(failed_file)
+        failures_by_file[failed_file] = []
+      failures_by_file[failed_file].append(failure)
+    for passed_file in self._junit_passes:
+      if passed_file not in files_order:
+        files_order.append(passed_file)
 
     testsuite = xml.etree.ElementTree.Element('testsuite')
-    testsuite.attrib['errors'] = str(num_errors)
-    testsuite.attrib['failures'] = str(num_failures)
+    testsuite.attrib['errors'] = str(len(errors_by_file))
+    testsuite.attrib['failures'] = str(len(failures_by_file))
     testsuite.attrib['name'] = 'cpplint'
+    testsuite.attrib['tests'] = str(len(files_order))
 
-    if num_errors == 0 and num_failures == 0:
-      testsuite.attrib['tests'] = str(1)
-      xml.etree.ElementTree.SubElement(testsuite, 'testcase', name='passed')
-
-    else:
-      testsuite.attrib['tests'] = str(num_errors + num_failures)
-      if num_errors > 0:
-        testcase = xml.etree.ElementTree.SubElement(testsuite, 'testcase')
-        testcase.attrib['name'] = 'errors'
-        error = xml.etree.ElementTree.SubElement(testcase, 'error')
-        error.text = '\n'.join(self._junit_errors)
-      if num_failures > 0:
-        # Group failures by file
-        failed_file_order = []
-        failures_by_file = {}
-        for failure in self._junit_failures:
-          failed_file = failure[0]
-          if failed_file not in failed_file_order:
-            failed_file_order.append(failed_file)
-            failures_by_file[failed_file] = []
-          failures_by_file[failed_file].append(failure)
-        # Create a testcase for each file
-        for failed_file in failed_file_order:
-          failures = failures_by_file[failed_file]
-          testcase = xml.etree.ElementTree.SubElement(testsuite, 'testcase')
-          testcase.attrib['name'] = failed_file
-          failure = xml.etree.ElementTree.SubElement(testcase, 'failure')
-          template = '{0}: {1} [{2}] [{3}]'
-          texts = [template.format(f[1], f[2], f[3], f[4]) for f in failures]
-          failure.text = '\n'.join(texts)
+    # Create a testcase for each file
+    for filename in files_order:
+      testcase = xml.etree.ElementTree.SubElement(testsuite, 'testcase')
+      testcase.attrib['name'] = filename
+      if filename in errors_by_file:
+        errors = errors_by_file[filename]
+        error_node = xml.etree.ElementTree.SubElement(testcase, 'error')
+        error.text = '\n'.join(errors)
+      if filename in failures_by_file:
+        failures = failures_by_file[filename]
+        failure_node = xml.etree.ElementTree.SubElement(testcase, 'failure')
+        template = '{0}: {1} [{2}] [{3}]'
+        texts = [template.format(f[1], f[2], f[3], f[4]) for f in failures]
+        failure_node.text = '\n'.join(texts)
 
     xml_decl = '<?xml version="1.0" encoding="UTF-8" ?>\n'
     return xml_decl + xml.etree.ElementTree.tostring(testsuite, 'utf-8').decode('utf-8')
@@ -1722,7 +1729,7 @@ def Error(filename, linenum, category, confidence, message):
   if _ShouldPrintError(category, confidence, linenum):
     _cpplint_state.IncrementErrorCount(category)
     if _cpplint_state.output_format == 'vs7':
-      _cpplint_state.PrintError('%s(%s): error cpplint: [%s] %s [%d]\n' % (
+      _cpplint_state.PrintError(filename, '%s(%s): error cpplint: [%s] %s [%d]\n' % (
           filename, linenum, category, message, confidence))
     elif _cpplint_state.output_format == 'eclipse':
       sys.stderr.write('%s:%s: warning: %s  [%s] [%d]\n' % (
@@ -6581,7 +6588,7 @@ def ProcessConfigOverrides(filename):
             try:
               _line_length = int(val)
             except ValueError:
-              _cpplint_state.PrintError('Line length must be numeric.')
+              _cpplint_state.PrintError(filename, 'Line length must be numeric.')
           elif name == 'extensions':
             ProcessExtensionsOption(val)
           elif name == 'root':
@@ -6594,11 +6601,13 @@ def ProcessConfigOverrides(filename):
             ProcessIncludeOrderOption(val)
           else:
             _cpplint_state.PrintError(
+                filename,
                 'Invalid configuration option (%s) in file %s\n' %
                 (name, cfg_file))
 
     except IOError:
       _cpplint_state.PrintError(
+          filename,
           "Skipping config file '%s': Can't open for reading\n" % cfg_file)
       keep_looking = False
 
@@ -6662,6 +6671,7 @@ def ProcessFile(filename, vlevel, extra_check_functions=None):
 
   except IOError:
     _cpplint_state.PrintError(
+        filename,
         "Skipping input '%s': Can't open for reading\n" % filename)
     _RestoreFilters()
     return
@@ -6672,7 +6682,7 @@ def ProcessFile(filename, vlevel, extra_check_functions=None):
   # When reading from stdin, the extension is unknown, so no cpplint tests
   # should rely on the extension.
   if filename != '-' and file_extension not in GetAllExtensions():
-    _cpplint_state.PrintError('Ignoring %s; not a valid file name '
+    _cpplint_state.PrintError(filename, 'Ignoring %s; not a valid file name '
                      '(%s)\n' % (filename, ', '.join(GetAllExtensions())))
   else:
     ProcessFileData(filename, file_extension, lines, Error,
@@ -6696,6 +6706,8 @@ def ProcessFile(filename, vlevel, extra_check_functions=None):
         Error(filename, linenum, 'whitespace/newline', 1,
               'Unexpected \\r (^M) found; better to use only \\n')
 
+  if old_errors == _cpplint_state.error_count:
+    _cpplint_state.AddPass(filename)
   # Suppress printing anything if --quiet was passed unless the error
   # count has increased after processing this file.
   if not _cpplint_state.quiet or old_errors != _cpplint_state.error_count:
